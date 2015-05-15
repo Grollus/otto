@@ -19,10 +19,13 @@ test.full <- read.csv("test.csv")
 #Need data formatted in different ways for h2o and xgboost. xgboost needs a matrix
 #form and h2o uses h2o specific frames. Need to set up a framework where I can easily 
 #work with the two------------------------------------------------------------------
+
 #First I will create a separate predictions frame and CV structure since they will 
 #be used for both (and should be able to be used with other models as well)---------
 predictions <- train.full[, ncol(train.full)]
 
+#Matrix for storing predicted probablities; needs to be dimensions of train.only
+pred.prob <- model.matrix(~ predictions - 1, data = predictions) 
 #Using caret to split the data for CV-----------------------------------------------
 set.seed(1234)
 cv.index <- createDataPartition(predictions, p = 0.25, list = FALSE)
@@ -50,6 +53,10 @@ x <- matrix(as.numeric(x), nrow(x), ncol(x)) #Converting chr to num
 trind <- 1:length(y)      #index to identify training data
 cvind <- (length(y)+1):nrow(x)
 
+#Test set as matrix-----------------------------------------------------------------
+x.test <- as.matrix(test.full)
+x.test <- matrix(as.numeric(x.test), nrow(x.test), ncol(x.test))
+
 #Setting up train/cv formats for h2o.deeplearning-----------------------------------
 #Creating fresh train.only and cv frames for h2o model------------------------------
 h2o.train.only <- train.full[-cv.index,]
@@ -69,6 +76,7 @@ for(i in 2:94){
 #Creating h2o objects---------------------------------------------------------------
 train.hex <- as.h2o(localH2O, h2o.train.only)
 cv.hex <- as.h2o(localH2O, h2o.cv[, 2:94])
+test.hex <- as.h2o(localH2O, test.full)
 
 #h2o requires identification of predictors and responses----------------------------
 predictors <- 2:(ncol(train.hex)-1)
@@ -149,7 +157,7 @@ xgb.bst <- xgboost(param = final.xgb.params, data = x[trind,], label = y,
                    nrounds = nround)
 
 #################################h2odeeplearn training##############################
-for( i in 1:2){
+for( i in 1:20){
   print(i)
   h2o.model <- h2o.deeplearning(x = predictors,
                             y = responses,
@@ -177,8 +185,57 @@ for( i in 1:2){
 xgb.model.prob <- predict(xgb.bst, newdata = x[cvind,])
 xgb.model.prob <- t(matrix(xgb.model.prob,9,length(xgb.model.prob)/9))
 
-h2o.deeplearn.prob <- 
+h2o.deeplearn.prob <- h2o.predict(h2o.model, cv.hex)
 
+#Calculating logloss----------------------------------------------------------------
+#logloss function; unsure of how accurately this reflects LB calculations-----------
+ll <- function(predicted, actual, eps = 1e-15){
+  predicted[predicted < eps] <- eps
+  predicted[predicted > 1 - eps] <- 1 - eps
+  score <- -1/nrow(actual)*(sum(actual*log(predicted)))
+  score
+}
+
+#Calculating ll for individual models-----------------------------------------------
+xgb.model.ll <- ll(xgb.model.prob, pred.prob[cv.index,])
+h2o.deeplearn.ll <- ll(as.data.frame(h2o.deeplearn.prob[,-1]), pred.prob[cv.index,])
+
+#################################Ensembling#########################################
+#Building grid to weight model probabilities----------------------------------------
+weight.grid <- data.frame(expand.grid(w1 = seq(from = 0.01, to = 1, by = 0.05),
+                                      w2 = seq(from = 0.01, to = 1, by = 0.05),
+                                      w3 = seq(from = 0.01, to = 1, by = 0.05)),
+                          ll = NA)
+
+#searching through weights to find optimum------------------------------------------
+for(x in 1:nrow(weight.grid)){
+  cv.prob.test <- 
+    ((xgb.model.prob * weight.grid$w1[x]) +
+       (as.data.frame(h2o.deeplearn.prob[,-1]) * weight.grid$w2[x]))/
+    sum(weight.grid[x, c("w1", "w2")])
+  weight.grid$ll[x] <- ll(cv.prob.test, pred.prob[cv.index, ])
+  print(x)
+}
+
+weight.best <- which.min(weight.grid$ll)
+weight.grid[weight.best, ]
+
+################################Building Test Probabilities#########################
+xgb.bst.prob.test <- predict(xgb.bst, newdata = x.test[, -1])
+h2o.deeplearn.prob.test <- h2o.predict(h2o.model, test.hex[, -1])
+
+
+test.prob <-
+  ((xgb.bst.prob.test * weight.grid[weight.best, "w1"]) +
+     (as.data.frame(h2o.deeplearn.prob.test[, -1]) * weight.grid[weight.best, "w2"]))/
+  sum(weight.grid[weight.best, c("w1", "w2")])
+
+#Save-------------------------------------------------------------------------------
+ensemble_submission1 <- read.csv("sampleSubmission.csv")
+
+ensemble_submission1[,2:10] <- ensemble_submission1[,2:10] + as.data.frame(test.prob)
+write.csv(ensemble_submission1, file = "ensemble_submission1.csv")
+save.image(file = "otto_ensemble_workspace.Rdata")
 
 
 
