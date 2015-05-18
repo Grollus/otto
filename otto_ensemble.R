@@ -61,6 +61,7 @@ x.test <- matrix(as.numeric(x.test), nrow(x.test), ncol(x.test))
 #Creating fresh train.only and cv frames for h2o model------------------------------
 h2o.train.only <- train.full[-cv.index,]
 h2o.cv <- train.full[cv.index,]
+h2o.test.full <- test.full
 
 
 for(i in 2:94){
@@ -73,10 +74,14 @@ for(i in 2:94){
   h2o.cv[, i] <- sqrt(h2o.cv[, i] + (3/8))
 }
 
+for(i in 2:94){
+  h2o.test.full[, i] <- as.numeric(h2o.test.full[, i])
+  h2o.test.full[, i] <- sqrt(h2o.test.full[, i] + (3/8))
+}
 #Creating h2o objects---------------------------------------------------------------
 train.hex <- as.h2o(localH2O, h2o.train.only)
 cv.hex <- as.h2o(localH2O, h2o.cv[, 2:94])
-test.hex <- as.h2o(localH2O, test.full)
+test.hex <- as.h2o(localH2O, h2o.test.full)
 
 #h2o requires identification of predictors and responses----------------------------
 predictors <- 2:(ncol(train.hex)-1)
@@ -175,17 +180,21 @@ for( i in 1:20){
                             train_samples_per_iteration = 2000,
                             max_w2 = 10,
                             seed = 1)
-  submission[,2:10] <- submission[,2:10] + as.data.frame(h2o.predict(model, cv.hex))[,2:10]
+  submission[,2:10] <- submission[,2:10] + as.data.frame(h2o.predict(h2o.model, cv.hex))[,2:10]
   print(i)
   
 }
-
+h2o.saveAll(object = localH2O, dir = "D:/RProgram/otto", save_cv = TRUE)
+#Dividing by the number of runs to have probabilities on 0 to 1 scale---------------
+submission.avg <- submission[,-1]/20
 
 ##################################CV before Ensembling##############################
 xgb.model.prob <- predict(xgb.bst, newdata = x[cvind,])
 xgb.model.prob <- t(matrix(xgb.model.prob,9,length(xgb.model.prob)/9))
 
-h2o.deeplearn.prob <- h2o.predict(h2o.model, cv.hex)
+#Dividing by number of h2o runs to get 0 to 1 scale---------------------------------
+#This was done in the for loop above for the h2o model------------------------------
+h2o.deeplearn.prob.avg <- submission[, -1]/20
 
 #Calculating logloss----------------------------------------------------------------
 #logloss function; unsure of how accurately this reflects LB calculations-----------
@@ -198,20 +207,19 @@ ll <- function(predicted, actual, eps = 1e-15){
 
 #Calculating ll for individual models-----------------------------------------------
 xgb.model.ll <- ll(xgb.model.prob, pred.prob[cv.index,])
-h2o.deeplearn.ll <- ll(as.data.frame(h2o.deeplearn.prob[,-1]), pred.prob[cv.index,])
+h2o.deeplearn.ll <- ll(as.data.frame(h2o.deeplearn.prob.avg), pred.prob[cv.index,])
 
 #################################Ensembling#########################################
 #Building grid to weight model probabilities----------------------------------------
 weight.grid <- data.frame(expand.grid(w1 = seq(from = 0.01, to = 1, by = 0.05),
-                                      w2 = seq(from = 0.01, to = 1, by = 0.05),
-                                      w3 = seq(from = 0.01, to = 1, by = 0.05)),
+                                      w2 = seq(from = 0.01, to = 1, by = 0.05)),
                           ll = NA)
 
 #searching through weights to find optimum------------------------------------------
 for(x in 1:nrow(weight.grid)){
   cv.prob.test <- 
     ((xgb.model.prob * weight.grid$w1[x]) +
-       (as.data.frame(h2o.deeplearn.prob[,-1]) * weight.grid$w2[x]))/
+       (h2o.deeplearn.prob.avg * weight.grid$w2[x]))/
     sum(weight.grid[x, c("w1", "w2")])
   weight.grid$ll[x] <- ll(cv.prob.test, pred.prob[cv.index, ])
   print(x)
@@ -230,14 +238,34 @@ test.prob <-
      (as.data.frame(h2o.deeplearn.prob.test[, -1]) * weight.grid[weight.best, "w2"]))/
   sum(weight.grid[weight.best, c("w1", "w2")])
 
+test.simple.avg <- ((xgb.bst.prob.test) + (as.data.frame(h2o.deeplearn.prob.test[, -1])))/
+  2
 #Save-------------------------------------------------------------------------------
 ensemble_submission1 <- read.csv("sampleSubmission.csv")
+h2o_deeplearn_submission2 <- read.csv("sampleSubmission.csv")
 
 ensemble_submission1[,2:10] <- ensemble_submission1[,2:10] + as.data.frame(test.prob)
-write.csv(ensemble_submission1, file = "ensemble_submission1.csv")
+write.csv(ensemble_submission1, file = "ensemble_submission1.csv", row.names = FALSE)
+
+h2o_deeplearn_submission2[,2:10] <- ensemble_submission1[,2:10] + as.data.frame(h2o.deeplearn.prob.test[, -1])
+write.csv(h2o_deeplearn_submission2, file = "h2o_deeplearn_benchmark2.csv", row.names = FALSE)
+
+simple_avg_ensemble_sub <- read.csv("sampleSubmission.csv")
+simple_avg_ensemble_sub[, 2:10] <- simple_avg_ensemble_sub[, 2:10] + as.data.frame(test.simple.avg)
+write.csv(simple_avg_ensemble_sub, file = "simple_avg_ensemble_sub.csv", row.names = FALSE)
+
+
+
 save.image(file = "otto_ensemble_workspace.Rdata")
 
+temp1 <- read.csv("D:/RProgram/submission7.csv")
+temp2 <- read.csv("submission_h2o_deeplearn_bench.csv")
+temp2[, -1] <- temp2[, -1]/20
 
+temp3 <- (temp1[, -1] + temp2[, -1])/2
+temp3 <- cbind(id = temp1[, 1], temp3)
+
+write.csv(temp3, file = "simple_avg_ensemble_sub.csv", row.names = FALSE)
 
 
 
